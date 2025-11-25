@@ -1,0 +1,348 @@
+--[[
+    SitHub - Base Template
+    - Home + 3 blank tabs
+    - Drag, Minimize, Close
+    - Safe: GUI-only, no movement/anti-cheat touching
+]]
+
+-----------------------------------------------------
+-- Services
+-----------------------------------------------------
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+-----------------------------------------------------
+-- State
+-----------------------------------------------------
+local gui, main
+local pages = {}
+local tabs = {}
+
+local minimized = false
+local fullSize = UDim2.new(0, 720, 0, 440)
+local minimizedSize = UDim2.new(0, 720, 0, 36)
+local tabFrameRef
+local pageFrameRef
+
+-----------------------------------------------------
+-- FPS COUNTER (UI only, no gameplay changes)
+-----------------------------------------------------
+local fps = 0
+local frameCount = 0
+local lastFpsTime = tick()
+
+RunService.RenderStepped:Connect(function()
+	frameCount += 1
+	local now = tick()
+	if now - lastFpsTime >= 1 then
+		fps = math.floor(frameCount / (now - lastFpsTime))
+		frameCount = 0
+		lastFpsTime = now
+	end
+end)
+
+-----------------------------------------------------
+-- GUI BUILD
+-----------------------------------------------------
+local function buildGUI()
+	if gui then gui:Destroy() end
+
+	gui = Instance.new("ScreenGui")
+	gui.Name = "SitHub"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 999999
+	gui.Parent = playerGui
+
+	main = Instance.new("Frame")
+	main.Size = fullSize
+	main.Position = UDim2.new(0.5, -360, 0.5, -220)
+	main.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+	main.BorderSizePixel = 0
+	main.Active = true
+	main.Parent = gui
+	Instance.new("UICorner", main).CornerRadius = UDim.new(0, 12)
+
+	-- Title bar
+	local titleBar = Instance.new("Frame")
+	titleBar.Size = UDim2.new(1, 0, 0, 36)
+	titleBar.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+	titleBar.BorderSizePixel = 0
+	titleBar.Parent = main
+	Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 12)
+
+	local title = Instance.new("TextLabel")
+	title.BackgroundTransparency = 1
+	title.Size = UDim2.new(1, -100, 1, 0)
+	title.Position = UDim2.new(0, 10, 0, 0)
+	title.Font = Enum.Font.SourceSansBold
+	title.TextSize = 18
+	title.TextColor3 = Color3.new(1, 1, 1)
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.Text = "SitHub"
+	title.Parent = titleBar
+
+	-- Minimize button
+	local minBtn = Instance.new("TextButton")
+	minBtn.Size = UDim2.new(0, 32, 0, 26)
+	minBtn.Position = UDim2.new(1, -80, 0, 5)
+	minBtn.Text = "-"
+	minBtn.Font = Enum.Font.SourceSansBold
+	minBtn.TextSize = 20
+	minBtn.TextColor3 = Color3.new(1, 1, 1)
+	minBtn.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+	minBtn.BorderSizePixel = 0
+	minBtn.Parent = titleBar
+	Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 6)
+
+	-- Close button
+	local closeBtn = Instance.new("TextButton")
+	closeBtn.Size = UDim2.new(0, 32, 0, 26)
+	closeBtn.Position = UDim2.new(1, -40, 0, 5)
+	closeBtn.Text = "X"
+	closeBtn.Font = Enum.Font.SourceSansBold
+	closeBtn.TextSize = 18
+	closeBtn.TextColor3 = Color3.new(1, 1, 1)
+	closeBtn.BackgroundColor3 = Color3.fromRGB(150, 40, 40)
+	closeBtn.BorderSizePixel = 0
+	closeBtn.Parent = titleBar
+	Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+
+	closeBtn.MouseButton1Click:Connect(function()
+		gui.Enabled = false
+	end)
+
+	-- Dragging
+	do
+		local dragging = false
+		local dragStart, startPos, dragInput
+
+		titleBar.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 then
+				dragging = true
+				dragStart = input.Position
+				startPos = main.Position
+				input.Changed:Connect(function()
+					if input.UserInputState == Enum.UserInputState.End then
+						dragging = false
+					end
+				end)
+			end
+		end)
+
+		titleBar.InputChanged:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseMovement then
+				dragInput = input
+			end
+		end)
+
+		UserInputService.InputChanged:Connect(function(input)
+			if input == dragInput and dragging then
+				local delta = input.Position - dragStart
+				main.Position = UDim2.new(
+					startPos.X.Scale,
+					startPos.X.Offset + delta.X,
+					startPos.Y.Scale,
+					startPos.Y.Offset + delta.Y
+				)
+			end
+		end)
+	end
+
+	-- Tabs container
+	local tabFrame = Instance.new("Frame")
+	tabFrame.Size = UDim2.new(0, 180, 1, -36)
+	tabFrame.Position = UDim2.new(0, 0, 0, 36)
+	tabFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+	tabFrame.BorderSizePixel = 0
+	tabFrame.Parent = main
+	Instance.new("UICorner", tabFrame).CornerRadius = UDim.new(0, 12)
+	tabFrameRef = tabFrame
+
+	local tabLayout = Instance.new("UIListLayout")
+	tabLayout.Padding = UDim.new(0, 6)
+	tabLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	tabLayout.Parent = tabFrame
+
+	-- Pages container
+	local pageFrame = Instance.new("Frame")
+	pageFrame.Size = UDim2.new(1, -180, 1, -36)
+	pageFrame.Position = UDim2.new(0, 180, 0, 36)
+	pageFrame.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+	pageFrame.BorderSizePixel = 0
+	pageFrame.Parent = main
+	Instance.new("UICorner", pageFrame).CornerRadius = UDim.new(0, 12)
+	pageFrameRef = pageFrame
+
+	local function makePage(name)
+		local f = Instance.new("Frame")
+		f.Name = name
+		f.Size = UDim2.new(1, 0, 1, 0)
+		f.BackgroundTransparency = 1
+		f.Visible = false
+		f.Parent = pageFrame
+		pages[name] = f
+		return f
+	end
+
+	local function makeTab(text, order, pageName)
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.new(1, -10, 0, 34)
+		b.Position = UDim2.new(0, 5, 0, 0)
+		b.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+		b.BorderSizePixel = 0
+		b.Font = Enum.Font.SourceSansBold
+		b.TextSize = 16
+		b.TextColor3 = Color3.new(1, 1, 1)
+		b.Text = text
+		b.LayoutOrder = order
+		b.Parent = tabFrame
+		Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+		tabs[text] = {button = b, pageName = pageName}
+		return b
+	end
+
+	-- Pages
+	local homePage = makePage("Home")
+	local tab1Page = makePage("Tab1")
+	local tab2Page = makePage("Tab2")
+	local tab3Page = makePage("Tab3")
+
+	-- Tabs
+	makeTab("Home", 1, "Home")
+	makeTab("Tab 1", 2, "Tab1")
+	makeTab("Tab 2", 3, "Tab2")
+	makeTab("Tab 3", 4, "Tab3")
+
+	local function switchTo(name)
+		for _, info in pairs(tabs) do
+			info.button.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+		end
+		for _, p in pairs(pages) do
+			p.Visible = false
+		end
+		local t = tabs[name]
+		if t then
+			t.button.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+			pages[t.pageName].Visible = true
+		end
+	end
+
+	for name, info in pairs(tabs) do
+		info.button.MouseButton1Click:Connect(function()
+			switchTo(name)
+		end)
+	end
+
+	switchTo("Home")
+
+	-- Minimize toggle
+	minBtn.MouseButton1Click:Connect(function()
+		minimized = not minimized
+		if minimized then
+			if tabFrameRef then tabFrameRef.Visible = false end
+			if pageFrameRef then pageFrameRef.Visible = false end
+			main.Size = minimizedSize
+		else
+			if tabFrameRef then tabFrameRef.Visible = true end
+			if pageFrameRef then pageFrameRef.Visible = true end
+			main.Size = fullSize
+		end
+	end)
+
+	-------------------------------------------------
+	-- HOME PAGE CONTENT
+	-------------------------------------------------
+	do
+		local profile = Instance.new("ImageLabel")
+		profile.Size = UDim2.new(0, 120, 0, 120)
+		profile.Position = UDim2.new(0, 25, 0, 40)
+		profile.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+		profile.BorderSizePixel = 0
+		profile.Parent = homePage
+		Instance.new("UICorner", profile).CornerRadius = UDim.new(0, 12)
+
+		local welcome = Instance.new("TextLabel")
+		welcome.Size = UDim2.new(1, -180, 0, 40)
+		welcome.Position = UDim2.new(0, 160, 0, 60)
+		welcome.BackgroundTransparency = 1
+		welcome.Font = Enum.Font.SourceSansBold
+		welcome.TextSize = 26
+		welcome.TextColor3 = Color3.new(1, 1, 1)
+		welcome.TextXAlignment = Enum.TextXAlignment.Left
+		welcome.Parent = homePage
+
+		local success, thumb = pcall(function()
+			return Players:GetUserThumbnailAsync(
+				player.UserId,
+				Enum.ThumbnailType.HeadShot,
+				Enum.ThumbnailSize.Size180x180
+			)
+		end)
+		if success then
+			profile.Image = thumb
+		end
+		welcome.Text = "Welcome, " .. player.Name
+
+		local desc = Instance.new("TextLabel")
+		desc.Size = UDim2.new(1, -180, 0, 28)
+		desc.Position = UDim2.new(0, 160, 0, 105)
+		desc.BackgroundTransparency = 1
+		desc.Font = Enum.Font.SourceSans
+		desc.TextSize = 16
+		desc.TextColor3 = Color3.fromRGB(200, 200, 200)
+		desc.TextXAlignment = Enum.TextXAlignment.Left
+		desc.Text = "Thanks for using SitHub :)"
+		desc.Parent = homePage
+
+		local fpsLabel = Instance.new("TextLabel")
+		fpsLabel.Size = UDim2.new(1, -180, 0, 24)
+		fpsLabel.Position = UDim2.new(0, 160, 0, 140)
+		fpsLabel.BackgroundTransparency = 1
+		fpsLabel.Font = Enum.Font.SourceSans
+		fpsLabel.TextSize = 16
+		fpsLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+		fpsLabel.TextXAlignment = Enum.TextXAlignment.Left
+		fpsLabel.Text = "FPS: updating..."
+		fpsLabel.Parent = homePage
+
+		-- FPS label updater
+		task.spawn(function()
+			while fpsLabel.Parent do
+				fpsLabel.Text = "FPS: " .. tostring(fps)
+				task.wait(0.5)
+			end
+		end)
+	end
+
+	-------------------------------------------------
+	-- TAB 1 / TAB 2 / TAB 3 (Blank Templates)
+	-------------------------------------------------
+	do
+		local function makePlaceholder(page, text)
+			local lbl = Instance.new("TextLabel")
+			lbl.Size = UDim2.new(1, -20, 0, 30)
+			lbl.Position = UDim2.new(0, 10, 0, 10)
+			lbl.BackgroundTransparency = 1
+			lbl.Font = Enum.Font.SourceSansBold
+			lbl.TextSize = 20
+			lbl.TextColor3 = Color3.new(1, 1, 1)
+			lbl.TextXAlignment = Enum.TextXAlignment.Left
+			lbl.Text = text
+			lbl.Parent = page
+		end
+
+		makePlaceholder(tab1Page, "Tab 1 (Empty) - Add your UI here")
+		makePlaceholder(tab2Page, "Tab 2 (Empty) - Add your UI here")
+		makePlaceholder(tab3Page, "Tab 3 (Empty) - Add your UI here")
+	end
+end
+
+-----------------------------------------------------
+-- Start
+-----------------------------------------------------
+buildGUI()
