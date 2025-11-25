@@ -1,0 +1,1277 @@
+--// SitHub - Supermarket Game
+--// Single LocalScript
+--// Tabs: Home, Item Searcher, Money Aquirer, Hitter
+--// Features:
+--//  * Item Searcher scans workspace.Shelves for items in Slots holders
+--//  * Reads PriceTags, Shelf Rarity, TakePrompt Percent
+--//  * Sort by Price / Rarity / Percent (high->low)
+--//  * Teleport + rarity-colored Highlight toggle
+--//  * Money Aquirer:
+--//      Method 1: ATM Money - Auto-hit a locked hittable under Spawners with held weapon
+--//      Method 2: Smooth move toward nearest Money (0.01s step)
+--//  * Evade:
+--//      At <= 90% health pathfind to nearest ATM "past" it, cooldown 8s
+--//      (Money method 2 respects evading; Method 1 ignores it)
+--//  * Hitter:
+--//      Auto-attack nearest player with equipped tool WeaponHitEvent
+--//      Toggle only via menu (no P key)
+--//  * Draggable UI + self-heal against being hidden/removed
+
+
+-----------------------------------------------------
+-- SERVICES
+-----------------------------------------------------
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local PathfindingService = game:GetService("PathfindingService")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+-----------------------------------------------------
+-- CONFIG / STATE
+-----------------------------------------------------
+local refreshInterval = 3
+local itemSortMode = "default" -- "default", "price", "rarity", "percent"
+
+local ITEM_HIGHLIGHT_NAME = "__SitHubItemHighlight"
+local highlightedItems = {} -- [item] = {enabled = bool, rarity = string}
+
+local money1Enabled = false -- Method 1 (ATM Money)
+local money1ThreadToken = 0
+
+local money2Enabled = false
+local money2ThreadToken = 0
+
+-- Locked hittable for Method 1
+local lockedHitbox = nil
+
+-- Hitter toggle
+local hitterEnabled = false
+
+-- Evade state
+local evading = false
+local evadeToken = 0
+local lastEvadeTime = 0
+
+-- Evade tuning
+local EVADE_HEALTH_FRACTION = 0.90
+local EVADE_COOLDOWN = 8           -- seconds between evades
+local ATM_SEARCH_RADIUS = 400      -- studs
+local ATM_PAST_DISTANCE = 18       -- studs beyond ATM
+
+
+-----------------------------------------------------
+-- UI SELF-HEAL STATE
+-----------------------------------------------------
+local currentGui = nil
+local rebuildToken = 0
+local connections = {}
+
+local function disconnectAll()
+	for _, c in ipairs(connections) do
+		pcall(function() c:Disconnect() end)
+	end
+	table.clear(connections)
+end
+
+-----------------------------------------------------
+-- MOVEMENT / POSITION HELPERS
+-----------------------------------------------------
+local function getCFrameFromObject(obj)
+	if not obj then return nil end
+
+	if obj:IsA("BasePart") then
+		return obj.CFrame
+	end
+
+	if obj:IsA("Model") then
+		if obj.PrimaryPart then return obj.PrimaryPart.CFrame end
+		for _, d in ipairs(obj:GetDescendants()) do
+			if d:IsA("BasePart") then return d.CFrame end
+		end
+		local ok, pivot = pcall(function() return obj:GetPivot() end)
+		if ok then return pivot end
+	end
+
+	if obj:IsA("Tool") then
+		local handle = obj:FindFirstChild("Handle")
+		if handle and handle:IsA("BasePart") then return handle.CFrame end
+		for _, d in ipairs(obj:GetDescendants()) do
+			if d:IsA("BasePart") then return d.CFrame end
+		end
+	end
+
+	return nil
+end
+
+local function getPositionFromObject(obj)
+	if not obj then return nil end
+
+	if obj:IsA("BasePart") then
+		return obj.Position
+	end
+
+	if obj:IsA("Model") then
+		local pp = obj.PrimaryPart
+		if pp and pp:IsA("BasePart") then return pp.Position end
+		for _, d in ipairs(obj:GetDescendants()) do
+			if d:IsA("BasePart") then return d.Position end
+		end
+	end
+
+	if obj:IsA("Tool") then
+		local handle = obj:FindFirstChild("Handle")
+		if handle and handle:IsA("BasePart") then return handle.Position end
+		for _, d in ipairs(obj:GetDescendants()) do
+			if d:IsA("BasePart") then return d.Position end
+		end
+	end
+
+	return nil
+end
+
+local function teleportTo(obj)
+	if evading then return end
+	local char = player.Character
+	if not char then return end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+
+	local cf = getCFrameFromObject(obj)
+	if cf then
+		hrp.CFrame = cf + Vector3.new(0, 4, 0)
+	end
+end
+
+-----------------------------------------------------
+-- RARITY HELPERS
+-----------------------------------------------------
+local function rarityToRank(rarity)
+	local r = string.lower(rarity or "")
+	if r:find("myth", 1, true) then return 6 end
+	if r:find("legend", 1, true) then return 5 end
+	if r:find("epic", 1, true) then return 4 end
+	if r:find("rare", 1, true) then return 3 end
+	if r:find("uncommon", 1, true) then return 2 end
+	if r:find("common", 1, true) then return 1 end
+	return 0
+end
+
+local function rarityToColor(rarity)
+	local r = string.lower(rarity or "")
+	if r:find("common", 1, true) then
+		return Color3.fromRGB(128,128,128)
+	elseif r:find("uncommon", 1, true) then
+		return Color3.fromRGB(0,255,0)
+	elseif r:find("rare", 1, true) then
+		return Color3.fromRGB(0,170,255)
+	elseif r:find("epic", 1, true) then
+		return Color3.fromRGB(160,32,240)
+	elseif r:find("legend", 1, true) then
+		return Color3.fromRGB(255,215,0)
+	elseif r:find("myth", 1, true) then
+		return Color3.fromRGB(255,0,0)
+	end
+	return Color3.fromRGB(0,0,0)
+end
+
+local function addHighlight(target, rarity)
+	if not target or not target.Parent then return end
+	local h = target:FindFirstChild(ITEM_HIGHLIGHT_NAME)
+	if not h then
+		h = Instance.new("Highlight")
+		h.Name = ITEM_HIGHLIGHT_NAME
+		h.FillTransparency = 0.5
+		h.OutlineTransparency = 0
+		h.Parent = target
+	end
+	local col = rarityToColor(rarity)
+	h.FillColor = col
+	h.OutlineColor = col
+end
+
+local function removeHighlight(target)
+	local h = target and target:FindFirstChild(ITEM_HIGHLIGHT_NAME)
+	if h then h:Destroy() end
+end
+
+local function setItemHighlight(item, on, rarity)
+	if not highlightedItems[item] then
+		highlightedItems[item] = {enabled = false, rarity = rarity or "Unknown"}
+	end
+	local data = highlightedItems[item]
+	data.enabled = on
+	if rarity and rarity ~= "" then data.rarity = rarity end
+
+	if on then addHighlight(item, data.rarity) else removeHighlight(item) end
+end
+
+-----------------------------------------------------
+-- ATM EVADE HELPERS (FOR HEALTH, NOT ATM MONEY)
+-----------------------------------------------------
+local function findATMs()
+	local atms = {}
+	local folder = workspace:FindFirstChild("ATMs")
+
+	if folder then
+		for _, obj in ipairs(folder:GetChildren()) do
+			if obj:IsA("Model") or obj:IsA("BasePart") then
+				table.insert(atms, obj)
+			end
+		end
+		return atms
+	end
+
+	for _, obj in ipairs(workspace:GetDescendants()) do
+		if (obj:IsA("Model") or obj:IsA("BasePart")) and obj.Name:lower():find("atm") then
+			table.insert(atms, obj)
+		end
+	end
+
+	return atms
+end
+
+local function getNearestATM(hrpPos)
+	local atms = findATMs()
+	local nearest, nearestDist = nil, math.huge
+
+	for _, atm in ipairs(atms) do
+		local pos = getPositionFromObject(atm)
+		if pos then
+			local d = (pos - hrpPos).Magnitude
+			if d < nearestDist then
+				nearest = atm
+				nearestDist = d
+			end
+		end
+	end
+
+	if nearest and nearestDist <= ATM_SEARCH_RADIUS then
+		return nearest, nearestDist
+	end
+	return nil, nil
+end
+
+local function followPathTo(targetPos, myEvadeToken)
+	local char = player.Character
+	if not char then return false end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	local humanoid = char:FindFirstChildOfClass("Humanoid")
+	if not hrp or not humanoid then return false end
+
+	local path = PathfindingService:CreatePath({
+		AgentRadius = 2,
+		AgentHeight = 5,
+		AgentCanJump = true,
+		AgentCanClimb = true
+	})
+
+	pcall(function()
+		path:ComputeAsync(hrp.Position, targetPos)
+	end)
+
+	if path.Status ~= Enum.PathStatus.Success then
+		humanoid:MoveTo(targetPos)
+		return humanoid.MoveToFinished:Wait()
+	end
+
+	for _, wp in ipairs(path:GetWaypoints()) do
+		if evadeToken ~= myEvadeToken then return false end
+		humanoid:MoveTo(wp.Position)
+		humanoid.MoveToFinished:Wait()
+	end
+
+	return true
+end
+
+-----------------------------------------------------
+-- LOW HEALTH EVADE (PATH TO ATM + PAST)
+-----------------------------------------------------
+local function triggerEvade()
+	if evading then return end
+	if tick() - lastEvadeTime < EVADE_COOLDOWN then return end
+
+	lastEvadeTime = tick()
+	evading = true
+	evadeToken += 1
+	local myEvadeToken = evadeToken
+
+	local char = player.Character
+	if not char then evading = false return end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hrp then evading = false return end
+
+	local atm = getNearestATM(hrp.Position)
+	if not atm then evading = false return end
+
+	local atmPos = getPositionFromObject(atm)
+	if not atmPos then evading = false return end
+
+	local dir = (atmPos - hrp.Position)
+	if dir.Magnitude < 1 then dir = Vector3.new(1,0,0) end
+	dir = dir.Unit
+
+	local pastPos = atmPos + dir * ATM_PAST_DISTANCE
+	followPathTo(pastPos, myEvadeToken)
+
+	evading = false
+end
+
+local function setupHealthWatcher(char)
+	local humanoid = char:WaitForChild("Humanoid")
+	local maxH = humanoid.MaxHealth
+
+	humanoid:GetPropertyChangedSignal("MaxHealth"):Connect(function()
+		maxH = humanoid.MaxHealth
+	end)
+
+	humanoid.HealthChanged:Connect(function(h)
+		if maxH > 0 and h > 0 and (h / maxH) <= EVADE_HEALTH_FRACTION then
+			triggerEvade()
+		end
+	end)
+end
+
+if player.Character then setupHealthWatcher(player.Character) end
+player.CharacterAdded:Connect(setupHealthWatcher)
+
+-----------------------------------------------------
+-- PRICE / PROMPT PARSERS
+-----------------------------------------------------
+local function extractPriceString(richText)
+	if not richText or richText == "" then return nil end
+	local plain = richText:gsub("<.->", "")
+	plain = plain:gsub("%$", "")
+	plain = plain:gsub(",", "")
+	plain = plain:gsub("%s+", "")
+	return plain:match("([%d%.]+%a*)")
+end
+
+local function priceToNumber(token)
+	if not token then return 0 end
+	local numPart, suffix = token:match("([%d%.]+)(%a*)")
+	local n = tonumber(numPart) or 0
+	suffix = (suffix or ""):lower()
+
+	local mult = 1
+	if suffix == "k" then mult = 1e3
+	elseif suffix == "m" then mult = 1e6
+	elseif suffix == "b" then mult = 1e9
+	elseif suffix == "t" then mult = 1e12
+	elseif suffix == "qa" then mult = 1e15
+	elseif suffix == "qi" then mult = 1e18
+	elseif suffix == "sx" then mult = 1e21
+	elseif suffix == "sp" then mult = 1e24
+	end
+
+	return n * mult
+end
+
+local function safeFindDesc(parent, name)
+	if not parent then return nil end
+	return parent:FindFirstChild(name, true)
+end
+
+local function getShelfRarity(shelfModel)
+	local rarityLabel = safeFindDesc(shelfModel, "Rarity")
+	if rarityLabel and rarityLabel:IsA("TextLabel") then
+		return rarityLabel.Text
+	end
+	return "Unknown"
+end
+
+local function getPriceForHolder(priceTagsFolder, holderIndex)
+	if not priceTagsFolder then return "N/A", 0 end
+
+	local tag = priceTagsFolder:FindFirstChild("PriceTag"..holderIndex)
+	tag = tag or priceTagsFolder:FindFirstChild("PriceTag"..tostring(holderIndex), true)
+	if not tag then return "N/A", 0 end
+
+	local txtLabel
+	for _, d in ipairs(tag:GetDescendants()) do
+		if d:IsA("TextLabel") then txtLabel = d break end
+	end
+	if not txtLabel then return "N/A", 0 end
+
+	local token = extractPriceString(txtLabel.Text)
+	return token or txtLabel.Text or "N/A", priceToNumber(token)
+end
+
+local function getPromptInfo(itemInstance)
+	local percentValue = 0
+	local percentText = "0%"
+
+	local prompt = itemInstance:FindFirstChild("TakePrompt", true)
+	if prompt and prompt:IsA("ProximityPrompt") then
+		local combined = ((prompt.ActionText or "").." "..(prompt.ObjectText or "").." "..(prompt.Name or "")):lower()
+		local pStr = combined:match("(%d+)%s*%%") or combined:match("(%d+)%s*percent")
+		if pStr then
+			percentValue = tonumber(pStr) or 0
+			percentText = pStr .. "%"
+		end
+	end
+
+	return percentText, percentValue
+end
+
+-----------------------------------------------------
+-- ITEM SEARCHER SCAN
+-----------------------------------------------------
+local function scanShelves()
+	local results = {}
+	local shelvesFolder = workspace:FindFirstChild("Shelves")
+	if not shelvesFolder then return results end
+
+	for inst, data in pairs(highlightedItems) do
+		if not inst.Parent then
+			highlightedItems[inst] = nil
+		elseif data.enabled then
+			addHighlight(inst, data.rarity)
+		end
+	end
+
+	for _, shelf in ipairs(shelvesFolder:GetChildren()) do
+		if shelf:IsA("Model") then
+			local slots = shelf:FindFirstChild("Slots")
+			local priceTags = shelf:FindFirstChild("PriceTags")
+			local rarityText = getShelfRarity(shelf)
+			local rarityRank = rarityToRank(rarityText)
+
+			if slots then
+				for _, holder in ipairs(slots:GetChildren()) do
+					if holder.Name:match("^Holder%d+") then
+						local holderIndex = tonumber(holder.Name:match("%d+")) or 0
+						local itemInst = holder:FindFirstChildWhichIsA("Tool") or holder:FindFirstChildWhichIsA("Model")
+
+						if itemInst then
+							local priceToken, priceValue = getPriceForHolder(priceTags, holderIndex)
+							local percentText, percentValue = getPromptInfo(itemInst)
+
+							table.insert(results, {
+								shelfName = shelf.Name,
+								holderName = holder.Name,
+								holderIndex = holderIndex,
+								item = itemInst,
+								itemName = itemInst.Name,
+								rarity = rarityText,
+								rarityRank = rarityRank,
+								priceToken = priceToken,
+								priceValue = priceValue,
+								percentText = percentText,
+								percentValue = percentValue,
+							})
+						end
+					end
+				end
+			end
+		end
+	end
+
+	if itemSortMode == "price" then
+		table.sort(results, function(a,b)
+			if a.priceValue == b.priceValue then return a.shelfName < b.shelfName end
+			return a.priceValue > b.priceValue
+		end)
+	elseif itemSortMode == "rarity" then
+		table.sort(results, function(a,b)
+			if a.rarityRank == b.rarityRank then return a.priceValue > b.priceValue end
+			return a.rarityRank > b.rarityRank
+		end)
+	elseif itemSortMode == "percent" then
+		table.sort(results, function(a,b)
+			if a.percentValue == b.percentValue then return a.priceValue > b.priceValue end
+			return a.percentValue > b.percentValue
+		end)
+	else
+		table.sort(results, function(a,b)
+			if a.shelfName == b.shelfName then return a.holderIndex < b.holderIndex end
+			return a.shelfName < b.shelfName
+		end)
+	end
+
+	return results
+end
+
+-----------------------------------------------------
+-- ATM MONEY HELPER: NEAREST HITTABLE Hitbox
+-----------------------------------------------------
+local function getNearestHittableHitbox()
+	local spawners = workspace:FindFirstChild("Spawners")
+	if not spawners then return nil end
+
+	local char = player.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return nil end
+
+	local nearestHitbox
+	local bestDist = math.huge
+
+	for _, child in ipairs(spawners:GetChildren()) do
+		-- Each child could be "HittableSpawn" or similar
+		local hitbox = child:FindFirstChild("Hitbox", true)
+		if not hitbox then
+			local hittable = child:FindFirstChild("Hittable")
+			if hittable then
+				hitbox = hittable:FindFirstChild("Hitbox", true)
+			end
+		end
+
+		if hitbox and hitbox:IsA("BasePart") then
+			local d = (hitbox.Position - hrp.Position).Magnitude
+			if d < bestDist then
+				bestDist = d
+				nearestHitbox = hitbox
+			end
+		end
+	end
+
+	return nearestHitbox
+end
+
+-----------------------------------------------------
+-- EQUIPPED TOOL (USED BY METHOD 1 + HITTER)
+-----------------------------------------------------
+local function getEquippedTool()
+	local char = player.Character
+	if not char then return nil end
+	for _, child in ipairs(char:GetChildren()) do
+		if child:IsA("Tool") then
+			return child
+		end
+	end
+	return nil
+end
+
+-----------------------------------------------------
+-- MONEY METHOD 1 (ATM MONEY - LOCKED TARGET)
+-----------------------------------------------------
+local function runMoneyMethod1(myToken)
+	money1ThreadToken += 1
+	local localToken = money1ThreadToken
+
+	-- We keep trying to lock onto a Hitbox at first,
+	-- then we NEVER change it while Method 1 is enabled.
+	while money1Enabled and myToken == rebuildToken and localToken == money1ThreadToken do
+		-- IGNORE evading; always run if toggled on
+
+		local tool = getEquippedTool()
+
+		-- If we don't have a locked target yet, try to find one
+		if not lockedHitbox then
+			lockedHitbox = getNearestHittableHitbox()
+		end
+
+		if tool and lockedHitbox then
+			local remote = tool:FindFirstChild("WeaponHitEvent")
+			if remote and remote:IsA("RemoteEvent") then
+				-- We do NOT care if lockedHitbox.Parent is nil,
+				-- we still send it. This mimics the exploit line.
+				remote:FireServer(lockedHitbox)
+			end
+		end
+
+		task.wait(0.2)
+	end
+
+	-- When Method 1 is turned OFF, clear lock so next time
+	-- you turn it on, it'll grab a fresh Hitbox.
+	lockedHitbox = nil
+end
+
+-----------------------------------------------------
+-- MONEY METHOD 2 (SMOOTH MOVE TO MONEY)
+-----------------------------------------------------
+local function runMoneyMethod2(myToken)
+	money2ThreadToken += 1
+	local localToken = money2ThreadToken
+
+	local moveSpeed = 23
+	local dt = 0.01
+	local stepSize = moveSpeed * dt
+
+	while money2Enabled and myToken == rebuildToken and localToken == money2ThreadToken do
+		if evading then
+			task.wait(0.05)
+		else
+			local spawnFolder = workspace:FindFirstChild("SpawnedCash")
+			if not spawnFolder then
+				task.wait(0.2)
+			else
+				local character = player.Character or player.CharacterAdded:Wait()
+				local hrp = character:WaitForChild("HumanoidRootPart")
+
+				local nearestModel = nil
+				local nearestDist = math.huge
+
+				for _, model in ipairs(spawnFolder:GetChildren()) do
+					if model.Name == "Money" or model.Name:lower():find("money") then
+						local pos = getPositionFromObject(model)
+						if pos then
+							local dist = (pos - hrp.Position).Magnitude
+							if dist < nearestDist then
+								nearestDist = dist
+								nearestModel = model
+							end
+						end
+					end
+				end
+
+				if nearestModel then
+					local targetPos = getPositionFromObject(nearestModel)
+					if targetPos then
+						local currentPos = hrp.Position
+						local distance = (targetPos - currentPos).Magnitude
+
+						if distance > 2 then
+							local direction = (targetPos - currentPos).Unit
+							local moveDistance = math.min(stepSize, distance)
+							local newPos = currentPos + direction * moveDistance
+							hrp.CFrame = CFrame.new(newPos, targetPos)
+						end
+					end
+				end
+
+				task.wait(dt)
+			end
+		end
+	end
+end
+
+-----------------------------------------------------
+-- HITTER (AUTO ATTACK NEAREST PLAYER)
+-----------------------------------------------------
+local function getClosestPlayer(maxRange)
+	local char = player.Character
+	if not char then return nil end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return nil end
+
+	local closest, closestDist = nil, maxRange
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= player and plr.Character then
+			local thrp = plr.Character:FindFirstChild("HumanoidRootPart")
+			local thum = plr.Character:FindFirstChildOfClass("Humanoid")
+			if thrp and thum and thum.Health > 0 then
+				local d = (thrp.Position - hrp.Position).Magnitude
+				if d < closestDist then
+					closestDist = d
+					closest = plr
+				end
+			end
+		end
+	end
+	return closest
+end
+
+RunService.Heartbeat:Connect(function()
+	if not hitterEnabled then return end
+	if evading then return end
+
+	local tool = getEquippedTool()
+	if not tool then return end
+
+	local remote = tool:FindFirstChild("WeaponHitEvent")
+	if not remote or not remote:IsA("RemoteEvent") then return end
+
+	local targetPlr = getClosestPlayer(12)
+	if not targetPlr or not targetPlr.Character then return end
+
+	local targetPart =
+		targetPlr.Character:FindFirstChild("RightUpperArm")
+		or targetPlr.Character:FindFirstChild("HumanoidRootPart")
+
+	if targetPart then
+		remote:FireServer(targetPart)
+	end
+end)
+
+-----------------------------------------------------
+-- GUI BUILDER
+-----------------------------------------------------
+local function buildSitHub()
+	rebuildToken += 1
+	local myToken = rebuildToken
+
+	disconnectAll()
+	if currentGui then pcall(function() currentGui:Destroy() end) end
+
+	---------------- ScreenGui ----------------
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "SitHub"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.DisplayOrder = 999999
+	gui.Enabled = true
+	gui.Parent = playerGui
+	currentGui = gui
+
+	---------------- Main Window ----------------
+	local main = Instance.new("Frame")
+	main.Name = "Main"
+	main.Size = UDim2.new(0, 700, 0, 420)
+	main.Position = UDim2.new(0.5, -350, 0.5, -210)
+	main.BackgroundColor3 = Color3.fromRGB(35,35,35)
+	main.BorderSizePixel = 0
+	main.Active = true
+	main.Visible = true
+	main.Parent = gui
+	Instance.new("UICorner", main).CornerRadius = UDim.new(0,12)
+
+	---------------- Title Bar ----------------
+	local titleBar = Instance.new("Frame")
+	titleBar.Size = UDim2.new(1,0,0,34)
+	titleBar.BackgroundColor3 = Color3.fromRGB(25,25,25)
+	titleBar.BorderSizePixel = 0
+	titleBar.Parent = main
+	Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0,12)
+
+	local titleText = Instance.new("TextLabel")
+	titleText.BackgroundTransparency = 1
+	titleText.Size = UDim2.new(1,-60,1,0)
+	titleText.Position = UDim2.new(0,10,0,0)
+	titleText.Font = Enum.Font.SourceSansBold
+	titleText.TextSize = 18
+	titleText.TextColor3 = Color3.new(1,1,1)
+	titleText.TextXAlignment = Enum.TextXAlignment.Left
+	titleText.Text = "BigSigma42's Sithub (Assault People in Walmart Simulator)"
+	titleText.Parent = titleBar
+
+	local exitBtn = Instance.new("TextButton")
+	exitBtn.Size = UDim2.new(0,32,0,26)
+	exitBtn.Position = UDim2.new(1,-40,0,4)
+	exitBtn.Text = "X"
+	exitBtn.TextSize = 18
+	exitBtn.Font = Enum.Font.SourceSansBold
+	exitBtn.BackgroundColor3 = Color3.fromRGB(150,40,40)
+	exitBtn.TextColor3 = Color3.new(1,1,1)
+	exitBtn.BorderSizePixel = 0
+	exitBtn.Parent = titleBar
+	Instance.new("UICorner", exitBtn).CornerRadius = UDim.new(0,6)
+	exitBtn.MouseButton1Click:Connect(function()
+		gui.Enabled = false
+	end)
+
+	---------------- Dragging ----------------
+	do
+		local dragging = false
+		local dragStart, startPos, dragInput
+
+		titleBar.InputBegan:Connect(function(i)
+			if i.UserInputType == Enum.UserInputType.MouseButton1 then
+				dragging = true
+				dragStart = i.Position
+				startPos = main.Position
+				i.Changed:Connect(function()
+					if i.UserInputState == Enum.UserInputState.End then dragging = false end
+				end)
+			end
+		end)
+
+		titleBar.InputChanged:Connect(function(i)
+			if i.UserInputType == Enum.UserInputType.MouseMovement then dragInput = i end
+		end)
+
+		UserInputService.InputChanged:Connect(function(i)
+			if i == dragInput and dragging then
+				local delta = i.Position - dragStart
+				main.Position = UDim2.new(
+					startPos.X.Scale, startPos.X.Offset + delta.X,
+					startPos.Y.Scale, startPos.Y.Offset + delta.Y
+				)
+			end
+		end)
+	end
+
+	---------------- Left Tabs ----------------
+	local tabs = Instance.new("Frame")
+	tabs.Size = UDim2.new(0, 170, 1, -34)
+	tabs.Position = UDim2.new(0,0,0,34)
+	tabs.BackgroundColor3 = Color3.fromRGB(30,30,30)
+	tabs.BorderSizePixel = 0
+	tabs.Parent = main
+	Instance.new("UICorner", tabs).CornerRadius = UDim.new(0,12)
+
+	local tabLayout = Instance.new("UIListLayout")
+	tabLayout.Padding = UDim.new(0,6)
+	tabLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	tabLayout.Parent = tabs
+
+	local function makeTab(text, order)
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.new(1,-10,0,38)
+		b.Position = UDim2.new(0,5,0,0)
+		b.BackgroundColor3 = Color3.fromRGB(45,45,45)
+		b.BorderSizePixel = 0
+		b.Font = Enum.Font.SourceSansBold
+		b.TextSize = 16
+		b.TextColor3 = Color3.new(1,1,1)
+		b.Text = text
+		b.LayoutOrder = order
+		b.Parent = tabs
+		Instance.new("UICorner", b).CornerRadius = UDim.new(0,6)
+		return b
+	end
+
+	local homeBtn   = makeTab("Home", 1)
+	local itemBtn   = makeTab("Item Searcher", 2)
+	local moneyBtn  = makeTab("Money Aquirer", 3)
+	local hitterBtn = makeTab("Killaura", 4)
+
+	---------------- Pages Container ----------------
+	local pages = Instance.new("Frame")
+	pages.Size = UDim2.new(1,-170,1,-34)
+	pages.Position = UDim2.new(0,170,0,34)
+	pages.BackgroundColor3 = Color3.fromRGB(40,40,40)
+	pages.BorderSizePixel = 0
+	pages.Parent = main
+	Instance.new("UICorner", pages).CornerRadius = UDim.new(0,12)
+
+	local function makePage(name)
+		local p = Instance.new("Frame")
+		p.Name = name
+		p.Size = UDim2.new(1,0,1,0)
+		p.BackgroundTransparency = 1
+		p.Visible = false
+		p.Parent = pages
+		return p
+	end
+
+	local homePage   = makePage("HomePage")
+	local itemPage   = makePage("ItemPage")
+	local moneyPage  = makePage("MoneyPage")
+	local hitterPage = makePage("HitterPage")
+
+	local function switchPage(btn, page)
+		for _, b in ipairs(tabs:GetChildren()) do
+			if b:IsA("TextButton") then b.BackgroundColor3 = Color3.fromRGB(45,45,45) end
+		end
+		btn.BackgroundColor3 = Color3.fromRGB(80,80,80)
+
+		for _, p in ipairs(pages:GetChildren()) do
+			if p:IsA("Frame") then p.Visible = (p == page) end
+		end
+	end
+
+	homeBtn.MouseButton1Click:Connect(function() switchPage(homeBtn, homePage) end)
+	itemBtn.MouseButton1Click:Connect(function() switchPage(itemBtn, itemPage) end)
+	moneyBtn.MouseButton1Click:Connect(function() switchPage(moneyBtn, moneyPage) end)
+	hitterBtn.MouseButton1Click:Connect(function() switchPage(hitterBtn, hitterPage) end)
+	switchPage(homeBtn, homePage)
+
+	-------------------------------------------------
+	-- HOME PAGE
+	-------------------------------------------------
+	do
+		local profile = Instance.new("ImageLabel")
+		profile.Size = UDim2.new(0,120,0,120)
+		profile.Position = UDim2.new(0,25,0,40)
+		profile.BackgroundColor3 = Color3.fromRGB(60,60,60)
+		profile.BorderSizePixel = 0
+		profile.Parent = homePage
+		Instance.new("UICorner", profile).CornerRadius = UDim.new(0,12)
+
+		local welcome = Instance.new("TextLabel")
+		welcome.Size = UDim2.new(1,-180,0,40)
+		welcome.Position = UDim2.new(0,160,0,60)
+		welcome.BackgroundTransparency = 1
+		welcome.Font = Enum.Font.SourceSansBold
+		welcome.TextSize = 26
+		welcome.TextColor3 = Color3.new(1,1,1)
+		welcome.TextXAlignment = Enum.TextXAlignment.Left
+		welcome.Parent = homePage
+
+		local thumb = Players:GetUserThumbnailAsync(
+			player.UserId,
+			Enum.ThumbnailType.HeadShot,
+			Enum.ThumbnailSize.Size180x180
+		)
+		profile.Image = thumb
+		welcome.Text = "Welcome, " .. player.Name
+
+		local desc = Instance.new("TextLabel")
+		desc.Size = UDim2.new(1,-180,0,28)
+		desc.Position = UDim2.new(0,160,0,105)
+		desc.BackgroundTransparency = 1
+		desc.Font = Enum.Font.SourceSans
+		desc.TextSize = 16
+		desc.TextColor3 = Color3.fromRGB(200,200,200)
+		desc.TextXAlignment = Enum.TextXAlignment.Left
+		desc.Text = "Live out your dreams or whatever - toomuchmeth1"
+		desc.Parent = homePage
+	end
+
+	-------------------------------------------------
+	-- ITEM SEARCHER PAGE
+	-------------------------------------------------
+	local sortBar = Instance.new("Frame")
+	sortBar.Size = UDim2.new(1,-10,0,40)
+	sortBar.Position = UDim2.new(0,5,0,5)
+	sortBar.BackgroundColor3 = Color3.fromRGB(30,30,30)
+	sortBar.BorderSizePixel = 0
+	sortBar.Parent = itemPage
+	Instance.new("UICorner", sortBar).CornerRadius = UDim.new(0,8)
+
+	local function makeSortBtn(text, xPos)
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.new(0,140,0,28)
+		b.Position = UDim2.new(0,xPos,0.5,-14)
+		b.BackgroundColor3 = Color3.fromRGB(90,90,90)
+		b.BorderSizePixel = 0
+		b.Font = Enum.Font.SourceSansBold
+		b.TextSize = 14
+		b.TextColor3 = Color3.new(1,1,1)
+		b.Text = text
+		b.Parent = sortBar
+		Instance.new("UICorner", b).CornerRadius = UDim.new(0,6)
+		return b
+	end
+
+	local sortPriceBtn   = makeSortBtn("Sort by Price", 10)
+	local sortRarityBtn  = makeSortBtn("Sort by Rarity", 160)
+	local sortPercentBtn = makeSortBtn("Sort by Percent", 310)
+
+	local function refreshSortButtons()
+		sortPriceBtn.BackgroundColor3   = Color3.fromRGB(90,90,90)
+		sortRarityBtn.BackgroundColor3  = Color3.fromRGB(90,90,90)
+		sortPercentBtn.BackgroundColor3 = Color3.fromRGB(90,90,90)
+
+		if itemSortMode == "price" then
+			sortPriceBtn.BackgroundColor3 = Color3.fromRGB(70,130,255)
+		elseif itemSortMode == "rarity" then
+			sortRarityBtn.BackgroundColor3 = Color3.fromRGB(70,130,255)
+		elseif itemSortMode == "percent" then
+			sortPercentBtn.BackgroundColor3 = Color3.fromRGB(70,130,255)
+		end
+	end
+	refreshSortButtons()
+
+	sortPriceBtn.MouseButton1Click:Connect(function()
+		itemSortMode = "price"; refreshSortButtons()
+	end)
+	sortRarityBtn.MouseButton1Click:Connect(function()
+		itemSortMode = "rarity"; refreshSortButtons()
+	end)
+	sortPercentBtn.MouseButton1Click:Connect(function()
+		itemSortMode = "percent"; refreshSortButtons()
+	end)
+
+	local itemScroll = Instance.new("ScrollingFrame")
+	itemScroll.Size = UDim2.new(1,-10,1,-55)
+	itemScroll.Position = UDim2.new(0,5,0,50)
+	itemScroll.BackgroundColor3 = Color3.fromRGB(30,30,30)
+	itemScroll.BorderSizePixel = 0
+	itemScroll.ScrollBarThickness = 6
+	itemScroll.CanvasSize = UDim2.new(0,0,0,0)
+	itemScroll.Parent = itemPage
+	Instance.new("UICorner", itemScroll).CornerRadius = UDim.new(0,8)
+
+	local itemLayout = Instance.new("UIListLayout")
+	itemLayout.Padding = UDim.new(0,5)
+	itemLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	itemLayout.Parent = itemScroll
+	itemLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+		itemScroll.CanvasSize = UDim2.new(0,0,0,itemLayout.AbsoluteContentSize.Y + 10)
+	end)
+
+	local function clearScroll(sf)
+		for _, c in ipairs(sf:GetChildren()) do
+			if not c:IsA("UIListLayout") then c:Destroy() end
+		end
+	end
+
+	local function makeItemRow(entry)
+		local row = Instance.new("Frame")
+		row.Size = UDim2.new(1,-8,0,48)
+		row.BackgroundColor3 = Color3.fromRGB(45,45,45)
+		row.BorderSizePixel = 0
+		row.Parent = itemScroll
+		Instance.new("UICorner", row).CornerRadius = UDim.new(0,6)
+
+		local label = Instance.new("TextLabel")
+		label.BackgroundTransparency = 1
+		label.Size = UDim2.new(0.68,0,1,0)
+		label.Position = UDim2.new(0,8,0,0)
+		label.Font = Enum.Font.SourceSansSemibold
+		label.TextSize = 14
+		label.TextColor3 = Color3.new(1,1,1)
+		label.TextXAlignment = Enum.TextXAlignment.Left
+		label.Text = string.format(
+			"%s | %s | %s | %s | %s | %s",
+			entry.shelfName,
+			entry.holderName,
+			entry.itemName,
+			entry.rarity,
+			entry.priceToken or "N/A",
+			entry.percentText or "0%"
+		)
+		label.Parent = row
+
+		local tpBtn = Instance.new("TextButton")
+		tpBtn.Size = UDim2.new(0.15,0,0.7,0)
+		tpBtn.Position = UDim2.new(0.70,0,0.15,0)
+		tpBtn.BackgroundColor3 = Color3.fromRGB(70,130,255)
+		tpBtn.BorderSizePixel = 0
+		tpBtn.Font = Enum.Font.SourceSansBold
+		tpBtn.TextSize = 14
+		tpBtn.TextColor3 = Color3.new(1,1,1)
+		tpBtn.Text = "Teleport"
+		tpBtn.Parent = row
+		Instance.new("UICorner", tpBtn).CornerRadius = UDim.new(0,6)
+
+		local hlBtn = Instance.new("TextButton")
+		hlBtn.Size = UDim2.new(0.14,0,0.7,0)
+		hlBtn.Position = UDim2.new(0.86,0,0.15,0)
+		hlBtn.BorderSizePixel = 0
+		hlBtn.Font = Enum.Font.SourceSansBold
+		hlBtn.TextSize = 14
+		hlBtn.TextColor3 = Color3.new(1,1,1)
+		hlBtn.Parent = row
+		Instance.new("UICorner", hlBtn).CornerRadius = UDim.new(0,6)
+
+		local function refreshHL()
+			local data = highlightedItems[entry.item]
+			local on = data and data.enabled
+			if on then
+				hlBtn.Text = "Unhl"
+				hlBtn.BackgroundColor3 = rarityToColor(entry.rarity)
+			else
+				hlBtn.Text = "Highlight"
+				hlBtn.BackgroundColor3 = Color3.fromRGB(90,90,90)
+			end
+		end
+		refreshHL()
+
+		tpBtn.MouseButton1Click:Connect(function()
+			teleportTo(entry.item)
+		end)
+
+		hlBtn.MouseButton1Click:Connect(function()
+			local data = highlightedItems[entry.item]
+			setItemHighlight(entry.item, not (data and data.enabled), entry.rarity)
+			refreshHL()
+		end)
+	end
+
+	-------------------------------------------------
+	-- MONEY AQUIRER PAGE (Method 1 = ATM Money)
+	-------------------------------------------------
+	do
+		local title = Instance.new("TextLabel")
+		title.Size = UDim2.new(1,-20,0,40)
+		title.Position = UDim2.new(0,10,0,20)
+		title.BackgroundTransparency = 1
+		title.Font = Enum.Font.SourceSansBold
+		title.TextSize = 26
+		title.TextColor3 = Color3.new(1,1,1)
+		title.TextXAlignment = Enum.TextXAlignment.Left
+		title.Text = "Money Aquirer"
+		title.Parent = moneyPage
+
+		local desc = Instance.new("TextLabel")
+		desc.Size = UDim2.new(1,-20,0,40)
+		desc.Position = UDim2.new(0,10,0,60)
+		desc.BackgroundTransparency = 1
+		desc.Font = Enum.Font.SourceSans
+		desc.TextSize = 16
+		desc.TextColor3 = Color3.fromRGB(200,200,200)
+		desc.TextXAlignment = Enum.TextXAlignment.Left
+		desc.TextWrapped = true
+		desc.Text = "Get Yo Bread UP!!. also recommend using noclip"
+		desc.Parent = moneyPage
+
+		local function makeMethodLabel(text, y)
+			local l = Instance.new("TextLabel")
+			l.Size = UDim2.new(1,-20,0,20)
+			l.Position = UDim2.new(0,10,0,y)
+			l.BackgroundTransparency = 1
+			l.Font = Enum.Font.SourceSansBold
+			l.TextSize = 14
+			l.TextColor3 = Color3.fromRGB(170,170,170)
+			l.TextXAlignment = Enum.TextXAlignment.Left
+			l.Text = text
+			l.Parent = moneyPage
+			return l
+		end
+
+		local function makeMethodToggle(y)
+			local b = Instance.new("TextButton")
+			b.Size = UDim2.new(0,200,0,36)
+			b.Position = UDim2.new(0,10,0,y)
+			b.BorderSizePixel = 0
+			b.Font = Enum.Font.SourceSansBold
+			b.TextSize = 18
+			b.TextColor3 = Color3.new(1,1,1)
+			b.Parent = moneyPage
+			Instance.new("UICorner", b).CornerRadius = UDim.new(0,8)
+			return b
+		end
+
+		local function makeMethodDesc(text, y, h)
+			local d = Instance.new("TextLabel")
+			d.Size = UDim2.new(1,-20,0,h)
+			d.Position = UDim2.new(0,10,0,y)
+			d.BackgroundTransparency = 1
+			d.Font = Enum.Font.SourceSans
+			d.TextSize = 14
+			d.TextColor3 = Color3.fromRGB(200,200,200)
+			d.TextXAlignment = Enum.TextXAlignment.Left
+			d.TextWrapped = true
+			d.Text = text
+			d.Parent = moneyPage
+			return d
+		end
+
+		-- Method 1: ATM Money
+		makeMethodLabel("Method 1 - ATM Money", 105)
+		local method1Toggle = makeMethodToggle(130)
+		makeMethodDesc("Turn on and infinite hit the same ATM forever :)", 170, 40)
+
+		-- Method 2
+		makeMethodLabel("Method 2", 220)
+		local method2Toggle = makeMethodToggle(245)
+		makeMethodDesc("(Best Method -asdzxcds2). Smoothly walks to nearest Money in SpawnedCash.", 285, 60)
+
+		local function refreshMoneyBtns()
+			method1Toggle.Text = money1Enabled and "ON" or "OFF"
+			method1Toggle.BackgroundColor3 = money1Enabled and Color3.fromRGB(50,120,50) or Color3.fromRGB(120,50,50)
+
+			method2Toggle.Text = money2Enabled and "ON" or "OFF"
+			method2Toggle.BackgroundColor3 = money2Enabled and Color3.fromRGB(50,120,50) or Color3.fromRGB(120,50,50)
+		end
+		refreshMoneyBtns()
+
+		method1Toggle.MouseButton1Click:Connect(function()
+			money1Enabled = not money1Enabled
+			refreshMoneyBtns()
+			if money1Enabled then
+				task.spawn(function() runMoneyMethod1(myToken) end)
+			else
+				money1ThreadToken += 1
+				lockedHitbox = nil
+			end
+		end)
+
+		method2Toggle.MouseButton1Click:Connect(function()
+			money2Enabled = not money2Enabled
+			refreshMoneyBtns()
+			if money2Enabled then
+				task.spawn(function() runMoneyMethod2(myToken) end)
+			else
+				money2ThreadToken += 1
+			end
+		end)
+	end
+
+	-------------------------------------------------
+	-- HITTER PAGE
+	-------------------------------------------------
+	do
+		local title = Instance.new("TextLabel")
+		title.Size = UDim2.new(1,-20,0,40)
+		title.Position = UDim2.new(0,10,0,20)
+		title.BackgroundTransparency = 1
+		title.Font = Enum.Font.SourceSansBold
+		title.TextSize = 26
+		title.TextColor3 = Color3.new(1,1,1)
+		title.TextXAlignment = Enum.TextXAlignment.Left
+		title.Text = "Killaura"
+		title.Parent = hitterPage
+
+		local desc = Instance.new("TextLabel")
+		desc.Size = UDim2.new(1,-20,0,30)
+		desc.Position = UDim2.new(0,10,0,60)
+		desc.BackgroundTransparency = 1
+		desc.Font = Enum.Font.SourceSans
+		desc.TextSize = 16
+		desc.TextColor3 = Color3.fromRGB(200,200,200)
+		desc.TextXAlignment = Enum.TextXAlignment.Left
+		desc.Text = "Your So Evil FR"
+		desc.Parent = hitterPage
+
+		local toggle = Instance.new("TextButton")
+		toggle.Size = UDim2.new(0,220,0,44)
+		toggle.Position = UDim2.new(0,10,0,105)
+		toggle.BorderSizePixel = 0
+		toggle.Font = Enum.Font.SourceSansBold
+		toggle.TextSize = 20
+		toggle.TextColor3 = Color3.new(1,1,1)
+		toggle.Parent = hitterPage
+		Instance.new("UICorner", toggle).CornerRadius = UDim.new(0,8)
+
+		local function refreshHitterBtn()
+			if hitterEnabled then
+				toggle.Text = "ON"
+				toggle.BackgroundColor3 = Color3.fromRGB(50,120,50)
+			else
+				toggle.Text = "OFF"
+				toggle.BackgroundColor3 = Color3.fromRGB(120,50,50)
+			end
+		end
+		refreshHitterBtn()
+
+		toggle.MouseButton1Click:Connect(function()
+			hitterEnabled = not hitterEnabled
+			refreshHitterBtn()
+		end)
+	end
+
+	-------------------------------------------------
+	-- AUTO REFRESH ITEM LIST
+	-------------------------------------------------
+	task.spawn(function()
+		while rebuildToken == myToken do
+			local entries = scanShelves()
+			clearScroll(itemScroll)
+			for _, e in ipairs(entries) do
+				makeItemRow(e)
+			end
+			task.wait(refreshInterval)
+		end
+	end)
+
+	-------------------------------------------------
+	-- SELF-HEALING
+	-------------------------------------------------
+	table.insert(connections, gui:GetPropertyChangedSignal("Enabled"):Connect(function()
+		if rebuildToken ~= myToken then return end
+		if not gui.Enabled then gui.Enabled = true end
+	end))
+
+	table.insert(connections, main:GetPropertyChangedSignal("Visible"):Connect(function()
+		if rebuildToken ~= myToken then return end
+		if not main.Visible then main.Visible = true end
+	end))
+
+	table.insert(connections, gui:GetPropertyChangedSignal("Parent"):Connect(function()
+		if rebuildToken ~= myToken then return end
+		if gui.Parent ~= playerGui then gui.Parent = playerGui end
+	end))
+
+	table.insert(connections, playerGui.ChildRemoved:Connect(function(child)
+		if rebuildToken ~= myToken then return end
+		if child == gui then
+			task.defer(function()
+				if rebuildToken == myToken then buildSitHub() end
+			end)
+		end
+	end))
+
+	task.spawn(function()
+		while rebuildToken == myToken do
+			pcall(function()
+				if gui.Parent ~= playerGui then gui.Parent = playerGui end
+				if not gui.Enabled then gui.Enabled = true end
+				if main and not main.Visible then main.Visible = true end
+			end)
+			task.wait(1)
+		end
+	end)
+end
+
+-----------------------------------------------------
+-- START
+-----------------------------------------------------
+buildSitHub()
