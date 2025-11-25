@@ -1,0 +1,1015 @@
+-- SitHub - VD Style Game (Home + Survivor + Killer + Misc)
+-- Unlock Mouse with P
+-----------------------------------------------------
+-- Services
+-----------------------------------------------------
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local mouse = player:GetMouse()
+
+-----------------------------------------------------
+-- State
+-----------------------------------------------------
+local gui, main
+local pages = {}
+local tabs = {}
+
+-- "Killer Highlight" toggle
+local killerHighlightOn = false
+local killerHighlights = {} -- [Player] = Highlight
+
+-- "Survivor Highlight" toggle
+local survivorHighlightOn = false
+local survivorESP = {}      -- [Player] = {highlight, billboard, hpLabel}
+
+-- generator UI
+local generatorLists = {
+	Survivor = {},
+	Killer = {},
+}
+
+-- killer player list UI
+local killerPlayerScroll
+local killerPlayerLastBuild = 0
+
+-- window
+local minimized = false
+local fullSize = UDim2.new(0, 720, 0, 440)
+local minimizedSize = UDim2.new(0, 720, 0, 36)
+local tabFrameRef
+local pageFrameRef
+
+-- speed + click TP
+local SPEED_MIN, SPEED_MAX = 16, 40
+local currentSpeed = 16
+local clickTpOn = false
+local clickTpConn
+
+
+----------------------------------------------------
+-- Unlock Mouse WITH P
+----------------------------------------------------
+local UserInputService = game:GetService("UserInputService")
+local player = game:GetService("Players").LocalPlayer
+
+local mouseLocked = true
+
+-- function to apply lock/unlock
+local function updateMouseLock()
+	if mouseLocked then
+		UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+		UserInputService.MouseIconEnabled = false
+	else
+		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+		UserInputService.MouseIconEnabled = true
+	end
+end
+
+updateMouseLock() -- apply starting state
+
+UserInputService.InputBegan:Connect(function(input, gp)
+	if gp then return end
+	if input.KeyCode == Enum.KeyCode.P then
+		mouseLocked = not mouseLocked
+		updateMouseLock()
+		print("Mouse lock:", mouseLocked and "ON" or "OFF")
+	end
+end)
+
+-- optional: automatically unlock on death/respawn
+player.CharacterAdded:Connect(function()
+	task.wait(1)
+	updateMouseLock()
+end)
+
+
+-----------------------------------------------------
+-- FPS
+-----------------------------------------------------
+local fps = 0
+local frameCount = 0
+local lastFpsTime = tick()
+
+RunService.RenderStepped:Connect(function()
+	frameCount += 1
+	local now = tick()
+	if now - lastFpsTime >= 1 then
+		fps = math.floor(frameCount / (now - lastFpsTime))
+		frameCount = 0
+		lastFpsTime = now
+	end
+end)
+
+-----------------------------------------------------
+-- Helpers
+-----------------------------------------------------
+local function getHumanoid()
+	local char = player.Character or player.CharacterAdded:Wait()
+	return char:WaitForChild("Humanoid")
+end
+
+local function applyWalkSpeed()
+	local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+	if hum then
+		hum.WalkSpeed = currentSpeed
+	end
+end
+
+player.CharacterAdded:Connect(function()
+	applyWalkSpeed()
+end)
+
+local function setClickTp(on)
+	if clickTpConn then
+		clickTpConn:Disconnect()
+		clickTpConn = nil
+		clickTpOn = false
+	end
+	if on then
+		clickTpOn = true
+		clickTpConn = mouse.Button1Down:Connect(function()
+			local char = player.Character
+			local hrp = char and char:FindFirstChild("HumanoidRootPart")
+			if not hrp then return end
+			local hit = mouse.Hit
+			if hit then
+				local pos = hit.p
+				hrp.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+			end
+		end)
+	end
+end
+
+local function getModelPrimaryPart(model)
+	if model.PrimaryPart then
+		return model.PrimaryPart
+	end
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") then
+			return d
+		end
+	end
+	return nil
+end
+
+local function teleportToPlayer(target)
+	if not target or not target.Character then return end
+	local char = player.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+	local thrp = target.Character:FindFirstChild("HumanoidRootPart") or getModelPrimaryPart(target.Character)
+	if not thrp then return end
+	hrp.CFrame = thrp.CFrame + Vector3.new(0, 4, 0)
+end
+
+-----------------------------------------------------
+-- Generators
+-----------------------------------------------------
+local function isGeneratorFixed(gen)
+	if not gen then return false end
+	local hitbox = gen:FindFirstChild("Hitbox") or gen:FindFirstChild("Hitbox", true)
+	if not hitbox then return false end
+
+	local light
+	for _, child in ipairs(hitbox:GetChildren()) do
+		if child:IsA("PointLight") then
+			light = child
+			break
+		end
+	end
+	if not light then return false end
+
+	local c = light.Color
+	-- simple green-ish check
+	if c.G > 0.7 and c.R < c.G * 0.5 and c.B < c.G * 0.5 then
+		return true
+	end
+	return false
+end
+
+local function collectGenerators()
+	local map = workspace:FindFirstChild("Map")
+	local gens = {}
+	if not map then return gens end
+	for _, d in ipairs(map:GetDescendants()) do
+		if d:IsA("Model") and d.Name == "Generator" then
+			table.insert(gens, d)
+		end
+	end
+	return gens
+end
+
+local function teleportToGenerator(gen)
+	if not gen then return end
+	local char = player.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+
+	local hitbox = gen:FindFirstChild("Hitbox") or gen:FindFirstChild("Hitbox", true)
+	local pp = hitbox or getModelPrimaryPart(gen)
+	if not pp then return end
+
+	hrp.CFrame = pp.CFrame + Vector3.new(0, 4, 0)
+end
+
+-- generic generator list builder (so we can reuse for Survivor and Killer with different widths)
+local function buildGeneratorList(parentPage, key, opts)
+	opts = opts or {}
+	local xScale = opts.xScale or 0
+	local xOffset = opts.xOffset or 10
+	local widthScale = opts.widthScale or 0.9
+	local titleY = opts.titleY or 90
+	local scrollY = opts.scrollY or 120
+
+	local title = Instance.new("TextLabel")
+	title.Size = UDim2.new(widthScale, -20, 0, 26)
+	title.Position = UDim2.new(xScale, xOffset, 0, titleY)
+	title.BackgroundTransparency = 1
+	title.Font = Enum.Font.SourceSansBold
+	title.TextSize = 18
+	title.TextColor3 = Color3.new(1, 1, 1)
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.Text = "Generators"
+	title.Parent = parentPage
+
+	local scroll = Instance.new("ScrollingFrame")
+	scroll.Size = UDim2.new(widthScale, -20, 0.7, -10)
+	scroll.Position = UDim2.new(xScale, xOffset, 0, scrollY)
+	scroll.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+	scroll.BorderSizePixel = 0
+	scroll.ScrollBarThickness = 6
+	scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+	scroll.Parent = parentPage
+	Instance.new("UICorner", scroll).CornerRadius = UDim.new(0, 8)
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 4)
+	layout.Parent = scroll
+	layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+		scroll.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 10)
+	end)
+
+	local entries = {}
+	local gens = collectGenerators()
+	for i, gen in ipairs(gens) do
+		local row = Instance.new("Frame")
+		row.Size = UDim2.new(1, -8, 0, 32)
+		row.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+		row.BorderSizePixel = 0
+		row.Parent = scroll
+		Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
+
+		local nameLabel = Instance.new("TextLabel")
+		nameLabel.Size = UDim2.new(0.4, -8, 1, 0)
+		nameLabel.Position = UDim2.new(0, 4, 0, 0)
+		nameLabel.BackgroundTransparency = 1
+		nameLabel.Font = Enum.Font.SourceSans
+		nameLabel.TextSize = 14
+		nameLabel.TextColor3 = Color3.new(1, 1, 1)
+		nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+		nameLabel.Text = string.format("Generator %d", i)
+		nameLabel.Parent = row
+
+		local statusLabel = Instance.new("TextLabel")
+		statusLabel.Size = UDim2.new(0.3, -8, 1, 0)
+		statusLabel.Position = UDim2.new(0.4, 4, 0, 0)
+		statusLabel.BackgroundTransparency = 1
+		statusLabel.Font = Enum.Font.SourceSansBold
+		statusLabel.TextSize = 14
+		statusLabel.TextColor3 = Color3.fromRGB(255, 80, 80)
+		statusLabel.Text = "Needs Repair"
+		statusLabel.Parent = row
+
+		local tpBtn = Instance.new("TextButton")
+		tpBtn.Size = UDim2.new(0.3, -8, 0.8, 0)
+		tpBtn.Position = UDim2.new(0.7, 4, 0.1, 0)
+		tpBtn.Font = Enum.Font.SourceSansBold
+		tpBtn.TextSize = 14
+		tpBtn.TextColor3 = Color3.new(1, 1, 1)
+		tpBtn.Text = "Teleport"
+		tpBtn.BackgroundColor3 = Color3.fromRGB(70, 130, 255)
+		tpBtn.BorderSizePixel = 0
+		tpBtn.Parent = row
+		Instance.new("UICorner", tpBtn).CornerRadius = UDim.new(0, 6)
+
+		tpBtn.MouseButton1Click:Connect(function()
+			teleportToGenerator(gen)
+		end)
+
+		table.insert(entries, {
+			generator = gen,
+			statusLabel = statusLabel,
+		})
+	end
+
+	generatorLists[key] = entries
+end
+
+local function updateGenerators()
+	local function updateList(list)
+		for _, entry in ipairs(list) do
+			local gen = entry.generator
+			local statusLabel = entry.statusLabel
+			if gen and gen.Parent then
+				if isGeneratorFixed(gen) then
+					statusLabel.Text = "Fixed"
+					statusLabel.TextColor3 = Color3.fromRGB(80, 255, 80)
+				else
+					statusLabel.Text = "Needs Repair"
+					statusLabel.TextColor3 = Color3.fromRGB(255, 80, 80)
+				end
+			else
+				statusLabel.Text = "Missing"
+				statusLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+			end
+		end
+	end
+
+	updateList(generatorLists.Survivor)
+	updateList(generatorLists.Killer)
+end
+
+-----------------------------------------------------
+-- Highlights (Killer / Survivor)
+-----------------------------------------------------
+local function updateTeamHighlights()
+	-- cleanup killer highlights
+	for plr, hl in pairs(killerHighlights) do
+		if (not killerHighlightOn) or not plr.Parent or not plr.Character or not plr.Team or plr.Team.Name ~= "Killer" then
+			if hl then hl:Destroy() end
+			killerHighlights[plr] = nil
+		end
+	end
+
+	-- cleanup survivor ESP
+	for plr, data in pairs(survivorESP) do
+		if (not survivorHighlightOn) or not plr.Parent or not plr.Character or not plr.Team or plr.Team.Name ~= "Survivors" then
+			if data.highlight then data.highlight:Destroy() end
+			if data.billboard then data.billboard:Destroy() end
+			survivorESP[plr] = nil
+		end
+	end
+
+	-- killer highlights (red)
+	if killerHighlightOn then
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if plr ~= player and plr.Team and plr.Team.Name == "Killer" and plr.Character then
+				if not killerHighlights[plr] then
+					local hl = Instance.new("Highlight")
+					hl.Name = "SitHubKillerHighlight"
+					hl.FillColor = Color3.fromRGB(255, 0, 0)
+					hl.OutlineColor = Color3.fromRGB(255, 0, 0)
+					hl.FillTransparency = 0.5
+					hl.OutlineTransparency = 0
+					hl.Adornee = plr.Character
+					hl.Parent = plr.Character
+					killerHighlights[plr] = hl
+				end
+			end
+		end
+	end
+
+	-- survivor ESP (blue + HP)
+	if survivorHighlightOn then
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if plr ~= player and plr.Team and plr.Team.Name == "Survivors" and plr.Character then
+				if not survivorESP[plr] then
+					local char = plr.Character
+					local hl = Instance.new("Highlight")
+					hl.Name = "SitHubSurvivorHighlight"
+					hl.FillColor = Color3.fromRGB(10, 30, 200)
+					hl.OutlineColor = Color3.fromRGB(20, 60, 255)
+					hl.FillTransparency = 0.5
+					hl.OutlineTransparency = 0
+					hl.Adornee = char
+					hl.Parent = char
+
+					local hrp = char:FindFirstChild("HumanoidRootPart") or getModelPrimaryPart(char)
+					if not hrp then
+						hl:Destroy()
+						continue
+					end
+
+					local billboard = Instance.new("BillboardGui")
+					billboard.Name = "SitHubSurvivorESP"
+					billboard.Size = UDim2.new(0, 140, 0, 40)
+					billboard.StudsOffset = Vector3.new(0, 3.5, 0)
+					billboard.AlwaysOnTop = true
+					billboard.Parent = hrp
+
+					local bg = Instance.new("Frame")
+					bg.Size = UDim2.new(1, 0, 1, 0)
+					bg.BackgroundColor3 = Color3.fromRGB(20, 20, 40)
+					bg.BackgroundTransparency = 0.3
+					bg.BorderSizePixel = 0
+					bg.Parent = billboard
+					Instance.new("UICorner", bg).CornerRadius = UDim.new(0, 6)
+
+					local label = Instance.new("TextLabel")
+					label.Name = "HPLabel"
+					label.Size = UDim2.new(1, -8, 1, 0)
+					label.Position = UDim2.new(0, 4, 0, 0)
+					label.BackgroundTransparency = 1
+					label.Font = Enum.Font.SourceSansBold
+					label.TextSize = 16
+					label.TextColor3 = Color3.new(1, 1, 1)
+					label.TextXAlignment = Enum.TextXAlignment.Left
+					label.Text = "HP: ?"
+					label.Parent = bg
+
+					survivorESP[plr] = {
+						highlight = hl,
+						billboard = billboard,
+						hpLabel = label,
+					}
+				end
+			end
+		end
+
+		for plr, data in pairs(survivorESP) do
+			if plr.Character then
+				local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+				if hum then
+					data.hpLabel.Text = string.format("%s | HP: %d/%d", plr.Name, hum.Health, hum.MaxHealth)
+				else
+					data.hpLabel.Text = plr.Name .. " | HP: ?"
+				end
+			end
+		end
+	end
+end
+
+-----------------------------------------------------
+-- Killer player list (scroll on Killer tab)
+-----------------------------------------------------
+local function rebuildKillerPlayerList()
+	if not killerPlayerScroll or not killerPlayerScroll.Parent then return end
+	killerPlayerLastBuild = tick()
+
+	for _, child in ipairs(killerPlayerScroll:GetChildren()) do
+		if not child:IsA("UIListLayout") then
+			child:Destroy()
+		end
+	end
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= player then
+			local row = Instance.new("Frame")
+			row.Size = UDim2.new(1, -8, 0, 32)
+			row.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+			row.BorderSizePixel = 0
+			row.Parent = killerPlayerScroll
+			Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
+
+			local nameLabel = Instance.new("TextLabel")
+			nameLabel.Size = UDim2.new(0.6, -8, 1, 0)
+			nameLabel.Position = UDim2.new(0, 4, 0, 0)
+			nameLabel.BackgroundTransparency = 1
+			nameLabel.Font = Enum.Font.SourceSans
+			nameLabel.TextSize = 14
+			nameLabel.TextColor3 = Color3.new(1, 1, 1)
+			nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+			nameLabel.Text = plr.Name
+			nameLabel.Parent = row
+
+			local tpBtn = Instance.new("TextButton")
+			tpBtn.Size = UDim2.new(0.4, -8, 0.8, 0)
+			tpBtn.Position = UDim2.new(0.6, 4, 0.1, 0)
+			tpBtn.Font = Enum.Font.SourceSansBold
+			tpBtn.TextSize = 14
+			tpBtn.TextColor3 = Color3.new(1, 1, 1)
+			tpBtn.Text = "Teleport"
+			tpBtn.BackgroundColor3 = Color3.fromRGB(70, 130, 255)
+			tpBtn.BorderSizePixel = 0
+			tpBtn.Parent = row
+			Instance.new("UICorner", tpBtn).CornerRadius = UDim.new(0, 6)
+
+			tpBtn.MouseButton1Click:Connect(function()
+				teleportToPlayer(plr)
+			end)
+		end
+	end
+end
+
+-----------------------------------------------------
+-- GUI BUILD
+-----------------------------------------------------
+local function buildGUI()
+	if gui then gui:Destroy() end
+
+	gui = Instance.new("ScreenGui")
+	gui.Name = "SitHub"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 999999
+	gui.Parent = playerGui
+
+	main = Instance.new("Frame")
+	main.Size = fullSize
+	main.Position = UDim2.new(0.5, -360, 0.5, -220)
+	main.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+	main.BorderSizePixel = 0
+	main.Active = true
+	main.Parent = gui
+	Instance.new("UICorner", main).CornerRadius = UDim.new(0, 12)
+
+	-- Title bar
+	local titleBar = Instance.new("Frame")
+	titleBar.Size = UDim2.new(1, 0, 0, 36)
+	titleBar.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+	titleBar.BorderSizePixel = 0
+	titleBar.Parent = main
+	Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 12)
+
+	local title = Instance.new("TextLabel")
+	title.BackgroundTransparency = 1
+	title.Size = UDim2.new(1, -100, 1, 0)
+	title.Position = UDim2.new(0, 10, 0, 0)
+	title.Font = Enum.Font.SourceSansBold
+	title.TextSize = 18
+	title.TextColor3 = Color3.new(1, 1, 1)
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.Text = "BigSigma42's SitHub (Violence District)"
+	title.Parent = titleBar
+
+	-- Minimize button
+	local minBtn = Instance.new("TextButton")
+	minBtn.Size = UDim2.new(0, 32, 0, 26)
+	minBtn.Position = UDim2.new(1, -80, 0, 5)
+	minBtn.Text = "-"
+	minBtn.Font = Enum.Font.SourceSansBold
+	minBtn.TextSize = 20
+	minBtn.TextColor3 = Color3.new(1, 1, 1)
+	minBtn.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+	minBtn.BorderSizePixel = 0
+	minBtn.Parent = titleBar
+	Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 6)
+
+	local closeBtn = Instance.new("TextButton")
+	closeBtn.Size = UDim2.new(0, 32, 0, 26)
+	closeBtn.Position = UDim2.new(1, -40, 0, 5)
+	closeBtn.Text = "X"
+	closeBtn.Font = Enum.Font.SourceSansBold
+	closeBtn.TextSize = 18
+	closeBtn.TextColor3 = Color3.new(1, 1, 1)
+	closeBtn.BackgroundColor3 = Color3.fromRGB(150, 40, 40)
+	closeBtn.BorderSizePixel = 0
+	closeBtn.Parent = titleBar
+	Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+
+	closeBtn.MouseButton1Click:Connect(function()
+		gui.Enabled = false
+	end)
+
+	-- Dragging
+	do
+		local dragging = false
+		local dragStart, startPos, dragInput
+
+		titleBar.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 then
+				dragging = true
+				dragStart = input.Position
+				startPos = main.Position
+				input.Changed:Connect(function()
+					if input.UserInputState == Enum.UserInputState.End then
+						dragging = false
+					end
+				end)
+			end
+		end)
+
+		titleBar.InputChanged:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseMovement then
+				dragInput = input
+			end
+		end)
+
+		UserInputService.InputChanged:Connect(function(input)
+			if input == dragInput and dragging then
+				local delta = input.Position - dragStart
+				main.Position = UDim2.new(
+					startPos.X.Scale,
+					startPos.X.Offset + delta.X,
+					startPos.Y.Scale,
+					startPos.Y.Offset + delta.Y
+				)
+			end
+		end)
+	end
+
+	-- Tabs + pages
+	local tabFrame = Instance.new("Frame")
+	tabFrame.Size = UDim2.new(0, 180, 1, -36)
+	tabFrame.Position = UDim2.new(0, 0, 0, 36)
+	tabFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+	tabFrame.BorderSizePixel = 0
+	tabFrame.Parent = main
+	Instance.new("UICorner", tabFrame).CornerRadius = UDim.new(0, 12)
+	tabFrameRef = tabFrame
+
+	local tabLayout = Instance.new("UIListLayout")
+	tabLayout.Padding = UDim.new(0, 6)
+	tabLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	tabLayout.Parent = tabFrame
+
+	local pageFrame = Instance.new("Frame")
+	pageFrame.Size = UDim2.new(1, -180, 1, -36)
+	pageFrame.Position = UDim2.new(0, 180, 0, 36)
+	pageFrame.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+	pageFrame.BorderSizePixel = 0
+	pageFrame.Parent = main
+	Instance.new("UICorner", pageFrame).CornerRadius = UDim.new(0, 12)
+	pageFrameRef = pageFrame
+
+	local function makePage(name)
+		local f = Instance.new("Frame")
+		f.Name = name
+		f.Size = UDim2.new(1, 0, 1, 0)
+		f.BackgroundTransparency = 1
+		f.Visible = false
+		f.Parent = pageFrame
+		pages[name] = f
+		return f
+	end
+
+	local function makeTab(text, order, pageName)
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.new(1, -10, 0, 34) -- smaller height
+		b.Position = UDim2.new(0, 5, 0, 0)
+		b.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+		b.BorderSizePixel = 0
+		b.Font = Enum.Font.SourceSansBold
+		b.TextSize = 16
+		b.TextColor3 = Color3.new(1, 1, 1)
+		b.Text = text
+		b.LayoutOrder = order
+		b.Parent = tabFrame
+		Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+		tabs[text] = {button = b, pageName = pageName}
+		return b
+	end
+
+	local homePage = makePage("Home")
+	local survivorPage = makePage("Survivor")
+	local killerPage = makePage("Killer")
+	local miscPage = makePage("Misc")
+
+	makeTab("Home",     1, "Home")
+	makeTab("Survivor", 2, "Survivor")
+	makeTab("Killer",   3, "Killer")
+	makeTab("Misc",     4, "Misc")
+
+	local function switchTo(name)
+		for _, info in pairs(tabs) do
+			info.button.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+		end
+		for _, p in pairs(pages) do
+			p.Visible = false
+		end
+		local t = tabs[name]
+		if t then
+			t.button.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+			pages[t.pageName].Visible = true
+		end
+	end
+
+	for name, info in pairs(tabs) do
+		info.button.MouseButton1Click:Connect(function()
+			switchTo(name)
+		end)
+	end
+
+	switchTo("Home")
+
+	-- minimize toggle
+	minBtn.MouseButton1Click:Connect(function()
+		minimized = not minimized
+		if minimized then
+			if tabFrameRef then tabFrameRef.Visible = false end
+			if pageFrameRef then pageFrameRef.Visible = false end
+			main.Size = minimizedSize
+		else
+			if tabFrameRef then tabFrameRef.Visible = true end
+			if pageFrameRef then pageFrameRef.Visible = true end
+			main.Size = fullSize
+		end
+	end)
+
+	-------------------------------------------------
+	-- HOME PAGE
+	-------------------------------------------------
+	do
+		local profile = Instance.new("ImageLabel")
+		profile.Size = UDim2.new(0, 120, 0, 120)
+		profile.Position = UDim2.new(0, 25, 0, 40)
+		profile.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+		profile.BorderSizePixel = 0
+		profile.Parent = homePage
+		Instance.new("UICorner", profile).CornerRadius = UDim.new(0, 12)
+
+		local welcome = Instance.new("TextLabel")
+		welcome.Size = UDim2.new(1, -180, 0, 40)
+		welcome.Position = UDim2.new(0, 160, 0, 60)
+		welcome.BackgroundTransparency = 1
+		welcome.Font = Enum.Font.SourceSansBold
+		welcome.TextSize = 26
+		welcome.TextColor3 = Color3.new(1, 1, 1)
+		welcome.TextXAlignment = Enum.TextXAlignment.Left
+		welcome.Parent = homePage
+
+		local success, thumb = pcall(function()
+			return Players:GetUserThumbnailAsync(
+				player.UserId,
+				Enum.ThumbnailType.HeadShot,
+				Enum.ThumbnailSize.Size180x180
+			)
+		end)
+		if success then
+			profile.Image = thumb
+		end
+		welcome.Text = "Welcome, " .. player.Name
+
+		local desc = Instance.new("TextLabel")
+		desc.Size = UDim2.new(1, -180, 0, 28)
+		desc.Position = UDim2.new(0, 160, 0, 105)
+		desc.BackgroundTransparency = 1
+		desc.Font = Enum.Font.SourceSans
+		desc.TextSize = 16
+		desc.TextColor3 = Color3.fromRGB(200, 200, 200)
+		desc.TextXAlignment = Enum.TextXAlignment.Left
+		desc.Text = "P To enable mouse. Thanks for using SitHub :)"
+		desc.Parent = homePage
+
+		local fpsLabel = Instance.new("TextLabel")
+		fpsLabel.Size = UDim2.new(1, -180, 0, 24)
+		fpsLabel.Position = UDim2.new(0, 160, 0, 140)
+		fpsLabel.BackgroundTransparency = 1
+		fpsLabel.Font = Enum.Font.SourceSans
+		fpsLabel.TextSize = 16
+		fpsLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+		fpsLabel.TextXAlignment = Enum.TextXAlignment.Left
+		fpsLabel.Text = "FPS: updating..."
+		fpsLabel.Parent = homePage
+
+		-- simple FPS updater
+		task.spawn(function()
+			while fpsLabel.Parent do
+				fpsLabel.Text = "FPS: " .. tostring(fps)
+				task.wait(0.5)
+			end
+		end)
+	end
+
+	-------------------------------------------------
+	-- SURVIVOR PAGE
+	-------------------------------------------------
+	do
+		local titleLabel = Instance.new("TextLabel")
+		titleLabel.Size = UDim2.new(1, -20, 0, 30)
+		titleLabel.Position = UDim2.new(0, 10, 0, 10)
+		titleLabel.BackgroundTransparency = 1
+		titleLabel.Font = Enum.Font.SourceSansBold
+		titleLabel.TextSize = 22
+		titleLabel.TextColor3 = Color3.new(1, 1, 1)
+		titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+		titleLabel.Text = "Survivor Tools"
+		titleLabel.Parent = survivorPage
+
+		-- smaller button so it doesn't overlap the list
+		local killerBtn = Instance.new("TextButton")
+		killerBtn.Size = UDim2.new(0, 160, 0, 30)
+		killerBtn.Position = UDim2.new(0, 10, 0, 44)
+		killerBtn.Font = Enum.Font.SourceSansBold
+		killerBtn.TextSize = 16
+		killerBtn.TextColor3 = Color3.new(1, 1, 1)
+		killerBtn.BorderSizePixel = 0
+		killerBtn.Parent = survivorPage
+		Instance.new("UICorner", killerBtn).CornerRadius = UDim.new(0, 8)
+
+		local function refreshKillerBtn()
+			killerBtn.Text = "Killer Highlight: " .. (killerHighlightOn and "ON" or "OFF")
+			killerBtn.BackgroundColor3 = killerHighlightOn and Color3.fromRGB(50, 120, 50) or Color3.fromRGB(120, 50, 50)
+		end
+		refreshKillerBtn()
+
+		killerBtn.MouseButton1Click:Connect(function()
+			killerHighlightOn = not killerHighlightOn
+			refreshKillerBtn()
+		end)
+
+		-- full-width generator list (below the smaller button)
+		buildGeneratorList(survivorPage, "Survivor", {
+			xScale = 0,
+			xOffset = 10,
+			widthScale = 0.95,
+			titleY = 90,
+			scrollY = 120,
+		})
+	end
+
+	-------------------------------------------------
+	-- KILLER PAGE
+	-------------------------------------------------
+	do
+		local titleLabel = Instance.new("TextLabel")
+		titleLabel.Size = UDim2.new(1, -20, 0, 30)
+		titleLabel.Position = UDim2.new(0, 10, 0, 10)
+		titleLabel.BackgroundTransparency = 1
+		titleLabel.Font = Enum.Font.SourceSansBold
+		titleLabel.TextSize = 22
+		titleLabel.TextColor3 = Color3.new(1, 1, 1)
+		titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+		titleLabel.Text = "Killer Tools"
+		titleLabel.Parent = killerPage
+
+		-- smaller Survivor Highlight button
+		local survBtn = Instance.new("TextButton")
+		survBtn.Size = UDim2.new(0, 160, 0, 30)
+		survBtn.Position = UDim2.new(0, 10, 0, 44)
+		survBtn.Font = Enum.Font.SourceSansBold
+		survBtn.TextSize = 16
+		survBtn.TextColor3 = Color3.new(1, 1, 1)
+		survBtn.BorderSizePixel = 0
+		survBtn.Parent = killerPage
+		Instance.new("UICorner", survBtn).CornerRadius = UDim.new(0, 8)
+
+		local function refreshSurvBtn()
+			survBtn.Text = "Survivor Highlight: " .. (survivorHighlightOn and "ON" or "OFF")
+			survBtn.BackgroundColor3 = survivorHighlightOn and Color3.fromRGB(50, 120, 50) or Color3.fromRGB(120, 50, 50)
+		end
+		refreshSurvBtn()
+
+		survBtn.MouseButton1Click:Connect(function()
+			survivorHighlightOn = not survivorHighlightOn
+			refreshSurvBtn()
+		end)
+
+		-- LEFT: half-width generator list
+		buildGeneratorList(killerPage, "Killer", {
+			xScale = 0,
+			xOffset = 10,
+			widthScale = 0.45,
+			titleY = 80,
+			scrollY = 110,
+		})
+
+		-- RIGHT: players scroll
+		local playerTitle = Instance.new("TextLabel")
+		playerTitle.Size = UDim2.new(0.45, -20, 0, 26)
+		playerTitle.Position = UDim2.new(0.5, 10, 0, 80)
+		playerTitle.BackgroundTransparency = 1
+		playerTitle.Font = Enum.Font.SourceSansBold
+		playerTitle.TextSize = 18
+		playerTitle.TextColor3 = Color3.new(1, 1, 1)
+		playerTitle.TextXAlignment = Enum.TextXAlignment.Left
+		playerTitle.Text = "Players"
+		playerTitle.Parent = killerPage
+
+		killerPlayerScroll = Instance.new("ScrollingFrame")
+		killerPlayerScroll.Size = UDim2.new(0.45, -20, 0.7, -10)
+		killerPlayerScroll.Position = UDim2.new(0.5, 10, 0, 110)
+		killerPlayerScroll.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+		killerPlayerScroll.BorderSizePixel = 0
+		killerPlayerScroll.ScrollBarThickness = 6
+		killerPlayerScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+		killerPlayerScroll.Parent = killerPage
+		Instance.new("UICorner", killerPlayerScroll).CornerRadius = UDim.new(0, 8)
+
+		local layout = Instance.new("UIListLayout")
+		layout.Padding = UDim.new(0, 4)
+		layout.Parent = killerPlayerScroll
+		layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+			killerPlayerScroll.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 10)
+		end)
+
+		rebuildKillerPlayerList()
+	end
+
+	-------------------------------------------------
+	-- MISC PAGE (speed + click TP)
+	-------------------------------------------------
+	do
+		local titleLabel = Instance.new("TextLabel")
+		titleLabel.Size = UDim2.new(1, -20, 0, 30)
+		titleLabel.Position = UDim2.new(0, 10, 0, 10)
+		titleLabel.BackgroundTransparency = 1
+		titleLabel.Font = Enum.Font.SourceSansBold
+		titleLabel.TextSize = 22
+		titleLabel.TextColor3 = Color3.new(1, 1, 1)
+		titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+		titleLabel.Text = "Misc"
+		titleLabel.Parent = miscPage
+
+		local speedLabel = Instance.new("TextLabel")
+		speedLabel.Size = UDim2.new(0, 220, 0, 24)
+		speedLabel.Position = UDim2.new(0, 10, 0, 50)
+		speedLabel.BackgroundTransparency = 1
+		speedLabel.Font = Enum.Font.SourceSans
+		speedLabel.TextSize = 16
+		speedLabel.TextColor3 = Color3.new(1, 1, 1)
+		speedLabel.TextXAlignment = Enum.TextXAlignment.Left
+		speedLabel.Text = "Player Speed: " .. currentSpeed
+		speedLabel.Parent = miscPage
+
+		local sliderBg = Instance.new("Frame")
+		sliderBg.Size = UDim2.new(0, 260, 0, 16)
+		sliderBg.Position = UDim2.new(0, 10, 0, 80)
+		sliderBg.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+		sliderBg.BorderSizePixel = 0
+		sliderBg.Parent = miscPage
+		Instance.new("UICorner", sliderBg).CornerRadius = UDim.new(0, 8)
+
+		local sliderFill = Instance.new("Frame")
+		sliderFill.Size = UDim2.new(0, 0, 1, 0)
+		sliderFill.Position = UDim2.new(0, 0, 0, 0)
+		sliderFill.BackgroundColor3 = Color3.fromRGB(70, 130, 255)
+		sliderFill.BorderSizePixel = 0
+		sliderFill.Parent = sliderBg
+		Instance.new("UICorner", sliderFill).CornerRadius = UDim.new(0, 8)
+
+		local draggingSlider = false
+
+		local function setSliderAlpha(alpha)
+			alpha = math.clamp(alpha, 0, 1)
+			sliderFill.Size = UDim2.new(alpha, 0, 1, 0)
+			currentSpeed = math.floor(SPEED_MIN + (SPEED_MAX - SPEED_MIN) * alpha + 0.5)
+			speedLabel.Text = "Player Speed: " .. currentSpeed
+			applyWalkSpeed()
+		end
+
+		setSliderAlpha((currentSpeed - SPEED_MIN) / (SPEED_MAX - SPEED_MIN))
+
+		local function updateFromInput(input)
+			local relX = input.Position.X - sliderBg.AbsolutePosition.X
+			local alpha = relX / sliderBg.AbsoluteSize.X
+			setSliderAlpha(alpha)
+		end
+
+		sliderBg.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 then
+				draggingSlider = true
+				updateFromInput(input)
+			end
+		end)
+
+		sliderBg.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 then
+				draggingSlider = false
+			end
+		end)
+
+		UserInputService.InputChanged:Connect(function(input)
+			if draggingSlider and input.UserInputType == Enum.UserInputType.MouseMovement then
+				updateFromInput(input)
+			end
+		end)
+
+		local clickBtn = Instance.new("TextButton")
+		clickBtn.Size = UDim2.new(0, 200, 0, 32)
+		clickBtn.Position = UDim2.new(0, 10, 0, 120)
+		clickBtn.Font = Enum.Font.SourceSansBold
+		clickBtn.TextSize = 16
+		clickBtn.TextColor3 = Color3.new(1, 1, 1)
+		clickBtn.BorderSizePixel = 0
+		clickBtn.Parent = miscPage
+		Instance.new("UICorner", clickBtn).CornerRadius = UDim.new(0, 8)
+
+		local function refreshClickBtn()
+			clickBtn.Text = "Click TP: " .. (clickTpOn and "ON" or "OFF")
+			clickBtn.BackgroundColor3 = clickTpOn and Color3.fromRGB(50, 120, 50) or Color3.fromRGB(120, 50, 50)
+		end
+		refreshClickBtn()
+
+		clickBtn.MouseButton1Click:Connect(function()
+			setClickTp(not clickTpOn)
+			refreshClickBtn()
+		end)
+	end
+
+	-------------------------------------------------
+	-- Update loop
+	-------------------------------------------------
+	task.spawn(function()
+		while gui and gui.Parent do
+			updateTeamHighlights()
+			updateGenerators()
+
+			if killerPlayerScroll and killerPlayerScroll.Parent and tick() - killerPlayerLastBuild > 1 then
+				rebuildKillerPlayerList()
+			end
+
+			task.wait(0.2)
+		end
+	end)
+end
+
+-----------------------------------------------------
+-- Start
+-----------------------------------------------------
+buildGUI()
+applyWalkSpeed()
